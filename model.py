@@ -1,163 +1,128 @@
-import argparse
-import scipy.io.wavfile as wavfile
-import traceback as tb
-import os
-import sys
+import torchvision
+import torchvision.datasets as dset
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader,Dataset
+import torchvision.utils
 import numpy as np
-import pandas as pd
-from scipy.spatial.distance import cdist, euclidean, cosine 
-import warnings
-from keras.models import load_model
-import logging
-logging.basicConfig(level=logging.ERROR)
-warnings.filterwarnings("ignore")
-import os
+import random
+from PIL import Image
+import torch
+from torch.autograd import Variable
+import PIL.ImageOps    
+import torch.nn as nn
+from torch import optim
+import torch.nn.functional as F
 
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # FATAL
-logging.getLogger('tensorflow').setLevel(logging.FATAL)
-#IMPORT USER-DEFINED FUNCTIONS
-from feature_extraction import get_embedding, get_embeddings_from_list_file
-from preprocess import get_fft_spectrum
-import parameters as p
-
-# args() returns the args passed to the script
-def args():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument('-t', '--task',
-                       help='"enroll" or "recognize"',
-                       required=True)
-    parser.add_argument( '-n', '--name',
-                        help='username',
-                        required=False)
-    parser.add_argument('-f', '--file',
-                        help='audiofile',
-                        type=lambda fn:file_choices(("csv","wav","flac"),fn),
-                       required=True)
-    ret = parser.parse_args()
-    return ret
+class SiameseNetwork(nn.Module):
+    def __init__(self):
+        super(SiameseNetwork, self).__init__()
+        self.cnn1 = nn.Sequential(
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(1, 4, kernel_size=3),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm2d(4),
+            
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(4, 8, kernel_size=3),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm2d(8),
 
 
-def enroll(name,file):
-    """audiofile
-        inputs: str (username)
-                str (filepath)
-        outputs: None"""
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(8, 8, kernel_size=3),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm2d(8),
 
-    print("Loading model weights from [{}]....".format(p.MODEL_FILE))
-    try:
-        model = load_model(p.MODEL_FILE)
-    except:
-        print("Failed to load weights from the weights file, please ensure *.pb file is present in the MODEL_FILE directory")
-        exit()
+
+        )
+
+        self.fc1 = nn.Sequential(
+            nn.Linear(8*227*227, 500),
+            nn.ReLU(inplace=True),
+
+            nn.Linear(500, 500),
+            nn.ReLU(inplace=True),
+
+            nn.Linear(500, 5))
+
+    def forward_once(self, x):
+        output = self.cnn1(x)
+        output = output.view(output.size()[0], -1)
+        output = self.fc1(output)
+        return output
     
-    try:
-        print("Processing enroll sample....")
-        enroll_result = get_embedding(model, file, p.MAX_SEC)
-        enroll_embs = np.array(enroll_result.tolist())
-        speaker = name
-    except:
-        print("Error processing the input audio file. Make sure the path.")
-    try:
-        np.save(os.path.join(p.EMBED_LIST_FILE,speaker +".npy"), enroll_embs)
-        print("Succesfully enrolled the user")
-    except:
-        print("Unable to save the user into the database.")
+    def forward(self, input1, input2):
+        output1 = self.forward_once(input1)
+        output2 = self.forward_once(input2)
+        return output1, output2
 
-def enroll_csv(csv_file):
-    """Enroll a list of users using csv file
-        inputs:  str (Path to comma seperated file for the path to voice & person to enroll)
-        outputs: None"""
+class CrossEntropyLoss(torch.nn.Module):
+    def __init__(self):
+        super(CrossEntropyLoss, self).__init__()
 
-    print("Getting the model weights from [{}]".format(p.MODEL_FILE))
-    try:
-        model = load_model(p.MODEL_FILE)
+    def forward(self, output, label):
+        label = label.long()
+        loss = F.cross_entropy(output, label)
+        return loss
 
-    except:
-        print("Failed to load weights from the weights file, please ensure *.pb file is present in the MODEL_FILE directory")
-        exit()
-    print("Processing enroll samples....")
-    try:
-        enroll_results = get_embeddings_from_list_file(model, csv_file, p.MAX_SEC)
-        enroll_embs = np.array([emb.tolist() for emb in enroll_results['embedding']])
-        speakers = enroll_results['speaker']
-    except:
-        print("Error processing the input audio files. Make sure the csv file has two columns (path to file,name of the person).")
+use_cuda = torch.cuda.is_available()
+device = torch.device("cuda" if use_cuda else "cpu")
+net = SiameseNetwork().to(device)
+criterion = CrossEntropyLoss().to(device)
+optimizer = optim.Adam(net.parameters(), lr = 0.001)
+counter = []
+loss_history = [] 
+iteration_number= 0
 
-    i=0
-    try:
-        for i in range(len(speakers)):
-            np.save(os.path.join(p.EMBED_LIST_FILE,str(speakers[i]) +".npy"), enroll_embs[i])
-            print("Succesfully enrolled the user")
-    except:
-        print("Unable to save the user into the database.")
-
-def recognize(file):
-    """Recognize the input audio file by comparing to saved users' voice prints
-        inputs: str (Path to audio file of unknown person to recognize)
-        outputs: str (Name of the person recognized)"""
-    
-    if os.path.exists(p.EMBED_LIST_FILE):
-        embeds = os.listdir(p.EMBED_LIST_FILE)
-    if len(embeds) is 0:
-        print("No enrolled users found")
-        exit()
-    print("Loading model weights from [{}]....".format(p.MODEL_FILE))
-    try:
-        model = load_model(p.MODEL_FILE)
-
-    except:
-        print("Failed to load weights from the weights file, please ensure *.pb file is present in the MODEL_FILE directory")
-        exit()
+def train(model, device, train_loader, epoch):
+    model.train()
+    losses = []
+    accurate_labels = 0
+    all_labels = 0
+    len_train_loader = len(train_loader)
+    for batch_idx, (data0, data1, label) in enumerate(tqdm.tqdm(train_loader)): #tqdm.tqdm(train_loader)
+        data0, data1, label = data0.to(device), data1.to(device), label.to(device)
+        optimizer.zero_grad()
         
-    distances = {}
-    print("Processing test sample....")
-    print("Comparing test sample against enroll samples....")
-    test_result = get_embedding(model, file, p.MAX_SEC)
-    test_embs = np.array(test_result.tolist())
-    for emb in embeds:
-        enroll_embs = np.load(os.path.join(p.EMBED_LIST_FILE,emb))
-        speaker = emb.replace(".npy","")
-        distance = euclidean(test_embs, enroll_embs)
-        distances.update({speaker:distance})
-    if min(list(distances.values()))<p.THRESHOLD:
-        print("Recognized: ",min(distances, key=distances.get))
-    else:
-        print("Could not identify the user, try enrolling again with a clear voice sample")
-        print("Score: ",min(list(distances.values())))
-        exit()
+        out = model(data0, data1)
+        loss_function = criterion(out, label)
+        losses.append(loss_function.item())
+        loss_function.backward()
         
-#Helper functions
-def file_choices(choices,filename):
-    ext = os.path.splitext(filename)[1][1:]
-    if ext not in choices:
-        parser.error("file doesn't end with one of {}".format(choices))
-    return filename
+        optimizer.step()
+        
+        accurate_labels += torch.sum(torch.argmax(out, dim=1) == label).cpu()
+        all_labels += len(label)
+            
+        if batch_idx % 20 == 0:
+            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}\tTrain Accuracy: {:.6f}'.format(
+                epoch, (batch_idx+1) * len(data0), len(train_loader.dataset),
+                100. * (batch_idx+1) / len(train_loader), loss_function.item(),
+                (100. * accurate_labels / all_labels)))
+    train_loss = np.mean(losses)
+    train_accuracy = 100. * accurate_labels / all_labels
+    print('\nTrain set: Average loss = {:.4f}, Train Accuracy = {:.4f}\n'.format(train_loss, train_accuracy))
+    return train_loss, train_accuracy
+     
 
-def get_extension(filename):
-    return os.path.splitext(filename)[1][1:]
 
-if __name__ == '__main__':
-    try:
-        args = args()
-    except Exception as e:
-        print('An Exception occured, make sure the file format is .wav or .flac')
-        exit()
-    task = args.task
-    file = args.file
-    try:
-        name = args.name
-    except:
-        if task =="enroll" and get_extension(file)!= 'csv':
-            print("Missing Arguement, -n name is required for the user name")
-            exit()
-    if get_extension(file)=='csv':
-        if task == 'enroll':
-            enroll_csv(file)
-        if task == 'recognize':
-            print("Recognize arguement cannot process a comma-seperated file. Please specify an auido file")
-    else:
-        if task == 'enroll':
-            enroll(name, file)
-        if task == 'recognize':
-            recognize(file)
+def test(model, device, test_loader):
+    model.eval()
+    accurate_labels = 0
+    all_labels = 0
+    losses = []
+    with torch.no_grad():
+        for batch_idx, (data0, data1, label) in enumerate(tqdm.tqdm(test_loader)):
+            data0, data1, label = data0.to(device), data1.to(device), label.to(device)
+            out = model(data0, data1)
+            loss_function = criterion(out, label)
+            losses.append(loss_function.item())
+
+            accurate_labels += torch.sum(torch.argmax(out, dim=1) == label).cpu()
+            all_labels += len(label)
+    test_loss = np.mean(losses)
+    test_accuracy = 100. * accurate_labels / all_labels
+    print('\nTest set: Average loss = {:.4f}, Test Accuracy = {:.4f}\n'.format(test_loss, test_accuracy))
+    return test_loss, test_accuracy
+
+EPOCHS = 5
