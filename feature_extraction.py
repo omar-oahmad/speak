@@ -1,47 +1,83 @@
-import os
+import librosa
+import soundfile as sf
+import random
+import torch
 import numpy as np
-import pandas as pd
-from scipy.spatial.distance import cdist, euclidean, cosine
 
-from preprocess import get_fft_spectrum
-import parameters as p
-
-
-def buckets(max_time, steptime, frameskip):
-    buckets = {}
-    frames_per_sec = int(1/frameskip)
-    end_frame = int(max_time*frames_per_sec)
-    step_frame = int(steptime*frames_per_sec)
-    for i in range(0, end_frame+1, step_frame):
-        s = i
-        s = np.floor((s-7+2)/2) + 1  # for first conv layer
-        s = np.floor((s-3)/2) + 1    # for first maxpool layer
-        s = np.floor((s-5+2)/2) + 1  # for second conv layer
-        s = np.floor((s-3)/2) + 1    # for second maxpool layer
-        s = np.floor((s-3+2)/1) + 1  # for third conv layer
-        s = np.floor((s-3+2)/1) + 1  # for fourth conv layer
-        s = np.floor((s-3+2)/1) + 1  # for fifth conv layer
-        s = np.floor((s-3)/2) + 1    # for fifth maxpool layer
-        s = np.floor((s-1)/1) + 1    # for sixth fully connected layer
-        if s > 0:
-            buckets[i] = int(s)
-    return buckets
+import myconfig
+import dataset
+import specaug
 
 
-def get_embedding(model, wav_file, max_time):
-    buckets_var = buckets(p.MAX_SEC, p.BUCKET_STEP, p.FRAME_STEP)
-    signal = get_fft_spectrum(wav_file, buckets_var)
-    embedding = np.squeeze(model.predict(signal.reshape(1,*signal.shape,1)))
-    return embedding
+def extract_features(audio_file):
+    #Extract MFCC features from an audio file, shape=(TIME, MFCC)
+    waveform, sample_rate = sf.read(audio_file)
+
+    # Convert to mono-channel.
+    if len(waveform.shape) == 2:
+        waveform = librosa.to_mono(waveform.transpose())
+
+    # Convert to 16kHz.
+    if sample_rate != 16000:
+        waveform = librosa.resample(waveform, sample_rate, 16000)
+
+    features = librosa.feature.mfcc(
+        y=waveform, sr=sample_rate, n_mfcc=myconfig.N_MFCC)
+    return features.transpose()
 
 
-def get_embedding_batch(model, wav_files, max_time):
-    return [ get_embedding(model, wav_file, max_time) for wav_file in wav_files ]
+def extract_sliding_windows(features):
+    #Extract sliding windows from features
+    sliding_windows = []
+    start = 0
+    while start + myconfig.SEQ_LEN <= features.shape[0]:
+        sliding_windows.append(features[start: start + myconfig.SEQ_LEN, :])
+        start += myconfig.SLIDING_WINDOW_STEP
+    return sliding_windows
 
 
-def get_embeddings_from_list_file(model, list_file, max_time):
-    buckets_var = buckets(p.MAX_SEC, p.BUCKET_STEP, p.FRAME_STEP)
-    result = pd.read_csv(list_file, delimiter=",")
-    result['features'] = result['filename'].apply(lambda x: get_fft_spectrum(x, buckets_var))
-    result['embedding'] = result['features'].apply(lambda x: np.squeeze(model.predict(x.reshape(1,*x.shape,1))))
-    return result[['filename','speaker','embedding']]
+def get_triplet_features(spk_to_utts):
+    #Get a triplet of anchor/pos/neg features
+    anchor_utt, pos_utt, neg_utt = dataset.get_triplet(spk_to_utts)
+    return (extract_features(anchor_utt),
+            extract_features(pos_utt),
+            extract_features(neg_utt))
+
+
+def trim_features(features, apply_specaug):
+    #Trim features to SEQ_LEN
+    full_length = features.shape[0]
+    start = random.randint(0, full_length - myconfig.SEQ_LEN)
+    trimmed_features = features[start: start + myconfig.SEQ_LEN, :]
+    if apply_specaug:
+        trimmed_features = specaug.apply_specaug(trimmed_features)
+    return trimmed_features
+
+
+class TrimmedTripletFeaturesFetcher:
+    #The fetcher of trimmed features for multi-processing
+
+    def __init__(self, spk_to_utts):
+        self.spk_to_utts = spk_to_utts
+
+    def __call__(self, _):
+        #Get a triplet of trimmed anchor/pos/neg features
+        anchor, pos, neg = get_triplet_features(self.spk_to_utts)
+        while (anchor.shape[0] < myconfig.SEQ_LEN or
+               pos.shape[0] < myconfig.SEQ_LEN or
+               neg.shape[0] < myconfig.SEQ_LEN):
+            anchor, pos, neg = get_triplet_features(self.spk_to_utts)
+        return np.stack([trim_features(anchor, myconfig.SPECAUG_TRAINING),
+                         trim_features(pos, myconfig.SPECAUG_TRAINING),
+                         trim_features(neg, myconfig.SPECAUG_TRAINING)])
+
+
+def get_batched_triplet_input(spk_to_utts, batch_size, pool=None):
+    #Get batched triplet input for PyTorch
+    fetcher = TrimmedTripletFeaturesFetcher(spk_to_utts)
+    if pool is None:
+        input_arrays = list(map(fetcher, range(batch_size)))
+    else:
+        input_arrays = pool.map(fetcher, range(batch_size))
+    batch_input = torch.from_numpy(np.concatenate(input_arrays)).float()
+    return batch_input
